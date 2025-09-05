@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=OpenList
+GenericName=File Management Server
+Comment=A resilient, long-term governance, community-driven file management platform
+Exec=openlist server
+Icon=org.oplist.openlist
+Type=Application
+Categories=Network;FileTransfer;System;
+StartupNotify=false
+NoDisplay=true
+Keywords=file;management;server;storage;cloud;sharing;
+MimeType=
+Terminal=false

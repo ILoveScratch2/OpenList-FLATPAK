@@ -1,0 +1,56 @@
+app-id: org.oplist.openlist
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: openlist
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=network
+  - --share=ipc
+  - --filesystem=host
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.freedesktop.FileManager1
+  - --env=OPENLIST_DATA_DIR=/var/lib/flatpak/app/org.oplist.openlist/current/active/files/share/openlist
+  - --env=OPENLIST_CONFIG_DIR=/var/lib/flatpak/app/org.oplist.openlist/current/active/files/share/openlist
+
+modules:
+  - name: openlist
+    buildsystem: simple
+    build-commands:
+      - tar -xzf openlist-linux-amd64.tar.gz
+      - chmod +x openlist
+      - install -Dm755 openlist ${FLATPAK_DEST}/bin/openlist-binary
+      - install -Dm755 openlist-wrapper.sh ${FLATPAK_DEST}/bin/openlist
+      - install -Dm644 org.oplist.openlist.desktop ${FLATPAK_DEST}/share/applications/org.oplist.openlist.desktop  
+      - install -Dm644 org.oplist.openlist.metainfo.xml ${FLATPAK_DEST}/share/metainfo/org.oplist.openlist.metainfo.xml
+      - |
+        for size in 16 24 32 48 64 72 96 128 144 160 192 224 240 248 256 320 384 512 1024; do
+          if [ -f "icons/${size}x${size}.png" ]; then
+            install -Dm644 "icons/${size}x${size}.png" "${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/org.oplist.openlist.png"
+          fi
+        done
+      - |
+        if [ -f "icons/logo.svg" ]; then
+          install -Dm644 "icons/logo.svg" "${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/org.oplist.openlist.svg"
+        fi
+
+    sources:
+      - type: file
+        url: https://github.com/OpenListTeam/OpenList/releases/download/RELEASE_TAG/openlist-linux-amd64.tar.gz
+        sha256: BINARY_SHA256
+        dest-filename: openlist-linux-amd64.tar.gz
+      
+      - type: file
+        path: openlist-wrapper.sh
+
+      - type: file  
+        path: org.oplist.openlist.desktop
+
+      - type: file
+        path: org.oplist.openlist.metainfo.xml
+
+      - type: dir
+        path: icons

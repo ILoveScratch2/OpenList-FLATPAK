@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>org.oplist.openlist</id>
+  <name>OpenList</name>
+  <summary>A resilient, long-term governance, community-driven file management platform</summary>
+  <description>
+    <p>
+      OpenList is a powerful file management and sharing platform that provides
+      a web-based interface for managing files and directories. It supports
+      multiple storage backends and offers features like file sharing, user
+      management, and more.
+    </p>
+    <p>
+      OpenList is a resilient, long-term governance, community-driven fork of AList — 
+      built to defend open source against trust-based attacks.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Multiple storage backends (Local, Aliyundrive, OneDrive, GoogleDrive, S3, WebDAV, and many more)</li>
+      <li>File preview (PDF, markdown, code, plain text)</li>
+      <li>Image preview in gallery mode</li>
+      <li>Video and audio preview with lyrics and subtitles support</li>
+      <li>Office documents preview (docx, pptx, xlsx)</li>
+      <li>Dark mode and internationalization</li>
+      <li>Protected routes with password protection and authentication</li>
+      <li>WebDAV support</li>
+      <li>File upload, delete, mkdir, rename, move and copy operations</li>
+      <li>Offline download capabilities</li>
+      <li>Copy files between different storage systems</li>
+    </ul>
+  </description>
+  
+  <launchable type="desktop-id">org.oplist.openlist.desktop</launchable>
+  
+  <provides>
+    <binary>openlist</binary>
+  </provides>
+  
+  <url type="homepage">https://github.com/OpenListTeam/OpenList</url>
+  <url type="bugtracker">https://github.com/OpenListTeam/OpenList/issues</url>
+  <url type="vcs-browser">https://github.com/OpenListTeam/OpenList</url>
+  <url type="contribute">https://github.com/OpenListTeam/OpenList/blob/main/CONTRIBUTING.md</url>
+  
+  <project_license>AGPL-3.0-or-later</project_license>
+  <metadata_license>CC0-1.0</metadata_license>
+  
+  <developer_name>OpenList Team</developer_name>
+  
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+    <category>System</category>
+  </categories>
+  
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+  
+  <releases>
+    <release version="PLACEHOLDER_VERSION" date="PLACEHOLDER_DATE">
+      <description>
+        <p>Automated Flatpak build from OpenList release PLACEHOLDER_VERSION</p>
+      </description>
+    </release>
+  </releases>
+</component>

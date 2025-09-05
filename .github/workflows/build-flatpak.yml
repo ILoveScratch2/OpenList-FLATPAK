@@ -1,0 +1,657 @@
+name: Build and Release Flatpak
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC to check for new releases
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new version'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check OpenList Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      tag_name: ${{ steps.get-version.outputs.tag_name }}
+      should_build: ${{ steps.check-build.outputs.should_build }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Get latest OpenList release
+      id: get-version
+      run: |
+        echo "=== Fetching latest release from OpenListTeam/OpenList ==="
+        
+        # Get latest release info from OpenList repository
+        RELEASE_INFO=$(curl -s "https://api.github.com/repos/OpenListTeam/OpenList/releases/latest")
+        
+        echo "API Response:"
+        echo "$RELEASE_INFO" | jq '.' || echo "Failed to parse JSON response"
+        
+        # Extract version and tag name with better error handling
+        TAG_NAME=$(echo "$RELEASE_INFO" | jq -r '.tag_name // empty')
+        
+        if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ] || [ "$TAG_NAME" = "empty" ]; then
+          echo "Error: Failed to get tag_name from API response"
+          echo "Using fallback version"
+          TAG_NAME="v1.0.0"
+        fi
+        
+        # Remove 'v' prefix if present
+        VERSION=${TAG_NAME#v}
+        
+        # Ensure version is clean (no 'v' prefix)
+        VERSION=$(echo "$VERSION" | sed 's/^v//')
+        
+        # Validate version format
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+          echo "Warning: Version format seems invalid: $VERSION"
+          echo "Using fallback version"
+          VERSION="1.0.0"
+          TAG_NAME="v1.0.0"
+        fi
+        
+        echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Latest OpenList version: $VERSION (tag: $TAG_NAME)"
+        
+    - name: Check if build is needed
+      id: check-build
+      run: |
+        VERSION="${{ steps.get-version.outputs.version }}"
+        FORCE_BUILD="${{ github.event.inputs.force_build }}"
+        
+        echo "Checking if build is needed for version: $VERSION"
+        
+        # Check if this version was already built
+        if [ "$FORCE_BUILD" = "true" ]; then
+          echo "Force build requested"
+          echo "should_build=true" >> $GITHUB_OUTPUT
+        else
+          # Check if release with this version already exists in current repo
+          EXISTING_RELEASE=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/tags/v$VERSION" | jq -r '.tag_name // empty')
+          
+          if [ -z "$EXISTING_RELEASE" ] || [ "$EXISTING_RELEASE" = "empty" ]; then
+            echo "Version $VERSION not found in releases, building..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Version $VERSION already exists, skipping build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+  build-flatpak:
+    name: Build OpenList Flatpak
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Flatpak
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y flatpak flatpak-builder qemu-user-static
+        
+        # Add Flathub repository
+        sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+        
+        # Install required runtime and SDK for current architecture
+        sudo flatpak install -y flathub org.freedesktop.Platform//23.08 org.freedesktop.Sdk//23.08
+        
+        # Install cross-compilation runtime and SDK for ARM64 if needed
+        if [ "${{ matrix.arch }}" = "aarch64" ]; then
+          echo "Installing aarch64 runtime and SDK..."
+          sudo flatpak install -y flathub org.freedesktop.Platform/aarch64/23.08 org.freedesktop.Sdk/aarch64/23.08
+          sudo flatpak install -y flathub org.freedesktop.Sdk.Extension.toolchain-aarch64//23.08
+          
+          # Enable QEMU for ARM64 emulation
+          sudo systemctl restart systemd-binfmt
+          echo "QEMU setup completed for aarch64"
+        fi
+        
+    - name: Prepare Flatpak manifest
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        TAG_NAME="${{ needs.check-version.outputs.tag_name }}"
+        ARCH="${{ matrix.arch }}"
+        
+        # Validate inputs
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+          echo "Error: VERSION is null or empty"
+          exit 1
+        fi
+        
+        if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+          echo "Error: TAG_NAME is null or empty"
+          exit 1
+        fi
+        
+        # Map flatpak arch to OpenList arch
+        case $ARCH in
+          "x86_64")
+            OPENLIST_ARCH="amd64"
+            ;;
+          "aarch64")
+            OPENLIST_ARCH="arm64"
+            ;;
+        esac
+        
+        echo "=== Version Information ==="
+        echo "Original TAG_NAME: $TAG_NAME"
+        echo "VERSION: $VERSION"
+        echo "Architecture: $ARCH (OpenList: $OPENLIST_ARCH)"
+        
+        # Download binary to calculate SHA256
+        echo "=== Downloading binary to calculate SHA256 ==="
+        DOWNLOAD_URL="https://github.com/OpenListTeam/OpenList/releases/download/$TAG_NAME/openlist-linux-$OPENLIST_ARCH.tar.gz"
+        echo "Download URL: $DOWNLOAD_URL"
+        
+        if ! wget -O "openlist-linux-$OPENLIST_ARCH.tar.gz" "$DOWNLOAD_URL"; then
+          echo "Error: Failed to download binary for $OPENLIST_ARCH"
+          exit 1
+        fi
+        
+        # Calculate SHA256
+        BINARY_SHA256=$(sha256sum "openlist-linux-$OPENLIST_ARCH.tar.gz" | awk '{print $1}')
+        echo "SHA256: $BINARY_SHA256"
+        
+        # Update manifest with version and SHA256
+        echo "=== Updating Flatpak manifest ==="
+        sed -e "s|RELEASE_TAG|$TAG_NAME|g" \
+            -e "s|BINARY_SHA256|$BINARY_SHA256|g" \
+            -e "s|openlist-linux-amd64.tar.gz|openlist-linux-$OPENLIST_ARCH.tar.gz|g" \
+            -e "s|openlist-linux-amd64|openlist-linux-$OPENLIST_ARCH|g" \
+            org.oplist.openlist.yml > "org.oplist.openlist-$VERSION-$ARCH.yml"
+        
+        # Update MetaInfo with version and date
+        CURRENT_DATE=$(date +%Y-%m-%d)
+        sed -e "s|PLACEHOLDER_VERSION|$VERSION|g" \
+            -e "s|PLACEHOLDER_DATE|$CURRENT_DATE|g" \
+            org.oplist.openlist.metainfo.xml > "org.oplist.openlist-$VERSION.metainfo.xml"
+        
+        # Copy updated MetaInfo back
+        cp "org.oplist.openlist-$VERSION.metainfo.xml" org.oplist.openlist.metainfo.xml
+        
+        # Cleanup downloaded binary (flatpak-builder will re-download)
+        rm -f "openlist-linux-$OPENLIST_ARCH.tar.gz"
+        
+        echo "Generated manifest: org.oplist.openlist-$VERSION-$ARCH.yml"
+        cat "org.oplist.openlist-$VERSION-$ARCH.yml"
+        
+    - name: Build Flatpak
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        ARCH="${{ matrix.arch }}"
+        
+        echo "=== Building Flatpak for $ARCH ==="
+        
+        # Set up cross-compilation for ARM64
+        if [ "$ARCH" = "aarch64" ]; then
+          export FLATPAK_BUILDER_ARCH="aarch64"
+          BUILD_ARGS="--arch=aarch64"
+        else
+          BUILD_ARGS=""
+        fi
+        
+        # Build the Flatpak
+        flatpak-builder $BUILD_ARGS --force-clean --repo=repo "build-$ARCH" "org.oplist.openlist-$VERSION-$ARCH.yml"
+        
+        echo "=== Flatpak build completed ==="
+        
+    - name: Export Flatpak bundle
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        ARCH="${{ matrix.arch }}"
+        
+        echo "=== Exporting Flatpak bundle ==="
+        
+        # Set architecture for bundle export
+        if [ "$ARCH" = "aarch64" ]; then
+          BUNDLE_ARGS="--arch=aarch64"
+        else
+          BUNDLE_ARGS=""
+        fi
+        
+        # Export as bundle
+        flatpak build-bundle $BUNDLE_ARGS repo "org.oplist.openlist-$VERSION-$ARCH.flatpak" org.oplist.openlist
+        
+        echo "Generated bundle: org.oplist.openlist-$VERSION-$ARCH.flatpak"
+        ls -la "org.oplist.openlist-$VERSION-$ARCH.flatpak"
+        
+    - name: Upload Flatpak artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: flatpak-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+        path: org.oplist.openlist-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.flatpak
+        retention-days: 90
+        
+    - name: Upload manifest artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: manifest-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+        path: org.oplist.openlist-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.yml
+        retention-days: 90
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, build-flatpak]
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      
+    - name: Set up GPG for signing
+      env:
+        GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+      run: |
+        if [ -n "$GPG_PRIVATE_KEY" ]; then
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "use-agent" >> ~/.gnupg/gpg.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          echo RELOADAGENT | gpg-connect-agent
+          
+          # Verify GPG key ID is available
+          if [ -n "$GPG_KEY_ID" ]; then
+            if gpg --list-secret-keys "$GPG_KEY_ID" >/dev/null 2>&1; then
+              echo "GPG_KEY_ID=$GPG_KEY_ID" >> $GITHUB_ENV
+              echo "GPG signing enabled with key: $GPG_KEY_ID"
+            else
+              echo "GPG key $GPG_KEY_ID not found, disabling signing"
+              echo "GPG_KEY_ID=" >> $GITHUB_ENV
+            fi
+          else
+            echo "No GPG key ID provided, disabling signing"
+            echo "GPG_KEY_ID=" >> $GITHUB_ENV
+          fi
+        else
+          echo "No GPG key provided, repository will be unsigned"
+          echo "GPG_KEY_ID=" >> $GITHUB_ENV
+        fi
+        
+    - name: Sign Flatpak bundles
+      env:
+        GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        
+        if [ -n "$GPG_KEY_ID" ]; then
+          echo "Signing Flatpak bundles..."
+          
+          for arch in x86_64 aarch64; do
+            BUNDLE_FILE="flatpak-$VERSION-$arch/org.oplist.openlist-$VERSION-$arch.flatpak"
+            
+            if [ -f "$BUNDLE_FILE" ]; then
+              echo "Signing $BUNDLE_FILE"
+              gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                  --armor --detach-sign --sign "$BUNDLE_FILE"
+              
+              if [ -f "$BUNDLE_FILE.asc" ]; then
+                echo "✅ Successfully signed $BUNDLE_FILE"
+              else
+                echo "❌ Failed to sign $BUNDLE_FILE"
+              fi
+            else
+              echo "Bundle file not found: $BUNDLE_FILE"
+            fi
+          done
+        else
+          echo "No GPG key available, skipping signing"
+        fi
+        
+    - name: Create installation script
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        
+        # Create installation script
+        cat > install-flatpak.sh << 'EOF'
+        #!/bin/bash
+        set -e
+
+        # Color definitions for better output
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        BLUE='\033[0;34m'
+        PURPLE='\033[0;35m'
+        CYAN='\033[0;36m'
+        WHITE='\033[1;37m'
+        NC='\033[0m' # No Color
+
+        # Logging functions with colors
+        log() {
+            local message="$1"
+            local level="${2:-info}"
+            case "$level" in
+                "error")
+                    echo -e "${RED}[ERROR]${NC} $message" >&2
+                    ;;
+                "success")
+                    echo -e "${GREEN}[SUCCESS]${NC} $message"
+                    ;;
+                "warning")
+                    echo -e "${YELLOW}[WARNING]${NC} $message"
+                    ;;
+                "info")
+                    echo -e "${BLUE}[INFO]${NC} $message"
+                    ;;
+                *)
+                    echo -e "${WHITE}[LOG]${NC} $message"
+                    ;;
+            esac
+        }
+
+        # Error handling function
+        handle_error() {
+            local exit_code="$1"
+            local error_message="$2"
+            log "$error_message" "error"
+            log "Exit code: $exit_code" "error"
+            exit $exit_code
+        }
+
+        echo -e "${CYAN}=== OpenList Flatpak Installation ===${NC}"
+
+        # Check if Flatpak is installed
+        if ! command -v flatpak &> /dev/null; then
+            log "Flatpak is not installed. Please install it first:" "error"
+            echo ""
+            echo -e "${PURPLE}On Ubuntu/Debian:${NC}"
+            echo -e "  ${WHITE}sudo apt install flatpak${NC}"
+            echo ""
+            echo -e "${PURPLE}On Fedora:${NC}"
+            echo -e "  ${WHITE}sudo dnf install flatpak${NC}"
+            echo ""
+            echo -e "${PURPLE}On Arch Linux:${NC}"
+            echo -e "  ${WHITE}sudo pacman -S flatpak${NC}"
+            echo ""
+            exit 1
+        fi
+
+        log "Flatpak is installed" "success"
+
+        # Add Flathub if not already added
+        log "Checking Flathub repository..." "info"
+        if ! flatpak remote-list | grep -q "flathub"; then
+            log "Adding Flathub repository..." "info"
+            flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+        else
+            log "Flathub repository already configured" "success"
+        fi
+
+        # Detect architecture
+        ARCH=$(uname -m)
+        case $ARCH in
+            "x86_64")
+                FLATPAK_ARCH="x86_64"
+                ;;
+            "aarch64"|"arm64")
+                FLATPAK_ARCH="aarch64"
+                ;;
+            *)
+                log "Unsupported architecture: $ARCH" "error"
+                log "Supported architectures: x86_64, aarch64" "error"
+                exit 1
+                ;;
+        esac
+
+        log "Detected architecture: $ARCH (Flatpak: $FLATPAK_ARCH)" "info"
+
+        # Download and install bundle
+        VERSION="VERSION_PLACEHOLDER"
+        BUNDLE_URL="https://github.com/GITHUB_REPO/releases/download/v$VERSION/org.oplist.openlist-$VERSION-$FLATPAK_ARCH.flatpak"
+        BUNDLE_FILE="org.oplist.openlist-$VERSION-$FLATPAK_ARCH.flatpak"
+
+        log "Downloading OpenList Flatpak bundle..." "info"
+        log "URL: $BUNDLE_URL" "info"
+
+        if curl -fL -o "$BUNDLE_FILE" "$BUNDLE_URL"; then
+            log "Download completed successfully" "success"
+        else
+            handle_error "$?" "Failed to download Flatpak bundle"
+        fi
+
+        # Install the bundle
+        log "Installing OpenList Flatpak..." "info"
+        if flatpak install --user --bundle "$BUNDLE_FILE" -y; then
+            log "OpenList installed successfully!" "success"
+        else
+            handle_error "$?" "Failed to install OpenList Flatpak"
+        fi
+
+        # Cleanup
+        rm -f "$BUNDLE_FILE"
+
+        echo ""
+        log "OpenList has been installed successfully!" "success"
+        echo ""
+        echo -e "${PURPLE}Usage:${NC}"
+        echo -e "  ${WHITE}flatpak run org.oplist.openlist${NC}                    # Run OpenList"
+        echo -e "  ${WHITE}flatpak run org.oplist.openlist server${NC}            # Start server mode"
+        echo -e "  ${WHITE}flatpak run org.oplist.openlist --help${NC}            # Show help"
+        echo ""
+        echo -e "${PURPLE}Management:${NC}"
+        echo -e "  ${WHITE}flatpak update org.oplist.openlist${NC}                # Update OpenList"
+        echo -e "  ${WHITE}flatpak uninstall org.oplist.openlist${NC}            # Uninstall OpenList"
+        echo -e "  ${WHITE}flatpak info org.oplist.openlist${NC}                  # Show app info"
+        echo ""
+        echo -e "${PURPLE}Data Location:${NC}"
+        echo -e "  ${WHITE}~/.local/share/openlist${NC}                           # Application data"
+        echo -e "  ${WHITE}~/.config/openlist${NC}                               # Configuration files"
+        echo ""
+        EOF
+        
+        # Replace placeholders
+        sed -i "s|VERSION_PLACEHOLDER|$VERSION|g" install-flatpak.sh
+        sed -i "s|GITHUB_REPO|${{ github.repository }}|g" install-flatpak.sh
+        chmod +x install-flatpak.sh
+        
+        echo "Created installation script"
+        
+    - name: Create GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        TAG_NAME="v$VERSION"
+        SOURCE_TAG="${{ needs.check-version.outputs.tag_name }}"
+        
+        # Prepare files for upload
+        FILES_TO_UPLOAD="install-flatpak.sh"
+        
+        # Add Flatpak bundles
+        for arch in x86_64 aarch64; do
+          BUNDLE_FILE="flatpak-$VERSION-$arch/org.oplist.openlist-$VERSION-$arch.flatpak"
+          MANIFEST_FILE="manifest-$VERSION-$arch/org.oplist.openlist-$VERSION-$arch.yml"
+          
+          if [ -f "$BUNDLE_FILE" ]; then
+            FILES_TO_UPLOAD="$FILES_TO_UPLOAD $BUNDLE_FILE"
+            
+            # Add signature if it exists
+            if [ -f "$BUNDLE_FILE.asc" ]; then
+              FILES_TO_UPLOAD="$FILES_TO_UPLOAD $BUNDLE_FILE.asc"
+            fi
+          fi
+          
+          if [ -f "$MANIFEST_FILE" ]; then
+            FILES_TO_UPLOAD="$FILES_TO_UPLOAD $MANIFEST_FILE"
+          fi
+        done
+        
+        # Create release with proper changelog
+        gh release create "$TAG_NAME" \
+          --title "OpenList Flatpak $VERSION" \
+          --notes "## Flatpak Package for OpenList $VERSION
+
+        This is an automated Flatpak package build from [OpenListTeam/OpenList $SOURCE_TAG](https://github.com/OpenListTeam/OpenList/releases/tag/$SOURCE_TAG).
+
+        ### 📦 Package Information
+        - **Source**: OpenListTeam/OpenList $SOURCE_TAG
+        - **Package Version**: $VERSION
+        - **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        - **Architectures**: x86_64, aarch64
+        - **Application ID**: \`org.oplist.openlist\`
+        - **Runtime**: org.freedesktop.Platform 23.08
+        - **GPG Signed**: $([ -n "$GPG_KEY_ID" ] && echo '✅ Yes' || echo '❌ No')
+
+        ### 🚀 Installation
+
+        #### 🎯 One-line Installation (Recommended)
+        \`\`\`bash
+        curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install-flatpak.sh | bash
+        \`\`\`
+
+        #### 📦 Manual Installation (x86_64)
+        \`\`\`bash
+        # Download bundle
+        wget https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/org.oplist.openlist-$VERSION-x86_64.flatpak
+
+        # Install
+        flatpak install --user --bundle org.oplist.openlist-$VERSION-x86_64.flatpak -y
+        \`\`\`
+
+        #### 📦 Manual Installation (ARM64/aarch64)
+        \`\`\`bash
+        # Download bundle
+        wget https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/org.oplist.openlist-$VERSION-aarch64.flatpak
+
+        # Install
+        flatpak install --user --bundle org.oplist.openlist-$VERSION-aarch64.flatpak -y
+        \`\`\`
+
+        #### 📋 Prerequisites
+        \`\`\`bash
+        # On Ubuntu/Debian
+        sudo apt install flatpak
+
+        # On Fedora
+        sudo dnf install flatpak
+
+        # On Arch Linux
+        sudo pacman -S flatpak
+
+        # Add Flathub (if not already added)
+        flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+        \`\`\`
+
+        ### 🔧 Usage
+        \`\`\`bash
+        # Run OpenList
+        flatpak run org.oplist.openlist
+
+        # Start server mode (typical usage)
+        flatpak run org.oplist.openlist server
+
+        # Show help
+        flatpak run org.oplist.openlist --help
+
+        # Show version
+        flatpak run org.oplist.openlist version
+        \`\`\`
+
+        ### 🔧 Management
+        \`\`\`bash
+        # Update OpenList
+        flatpak update org.oplist.openlist
+
+        # Uninstall
+        flatpak uninstall org.oplist.openlist
+
+        # Show application info
+        flatpak info org.oplist.openlist
+
+        # List installed Flatpak apps
+        flatpak list --app
+        \`\`\`
+
+        ### 📁 Data Locations
+        - **Application Data**: \`~/.local/share/openlist\`
+        - **Configuration**: \`~/.config/openlist\`
+        - **Flatpak Data**: \`~/.var/app/org.oplist.openlist\`
+
+        ### 🔐 Security & Permissions
+        This Flatpak package has the following permissions:
+        - **Network access**: Required for web server functionality
+        - **File system access**: Host file system access for file management
+        - **Wayland/X11**: For potential GUI elements
+        - **Notifications**: For system notifications
+        - **Hardware acceleration**: For video processing
+
+        ### 🔍 Verification
+        \`\`\`bash
+        # Verify installation
+        flatpak run org.oplist.openlist --version
+
+        # Check application status
+        flatpak info org.oplist.openlist
+
+        # View application logs
+        journalctl --user -f _SYSTEMD_USER_UNIT=org.oplist.openlist.service
+        \`\`\`
+
+        ### 🆘 Troubleshooting
+        \`\`\`bash
+        # Reset application data
+        flatpak run --command=sh org.oplist.openlist
+        # Then inside the container: rm -rf ~/.local/share/openlist/*
+
+        # Run with verbose output
+        flatpak run --verbose org.oplist.openlist
+
+        # Check Flatpak logs
+        journalctl --user -u flatpak-session.service
+        \`\`\`
+
+        ### 🗑️ Complete Uninstallation
+        \`\`\`bash
+        # Stop any running instances
+        pkill -f 'flatpak.*org.oplist.openlist' || true
+
+        # Uninstall the application
+        flatpak uninstall org.oplist.openlist -y
+
+        # Remove application data (optional)
+        rm -rf ~/.local/share/openlist
+        rm -rf ~/.config/openlist
+        rm -rf ~/.var/app/org.oplist.openlist
+        \`\`\`
+
+        ---
+        **🔒 Security Note**: $([ -n "$GPG_KEY_ID" ] && echo "This Flatpak package is GPG-signed for integrity verification." || "This package is not GPG-signed. Verify the source before installation.")" \
+          $FILES_TO_UPLOAD
+
+  cleanup:
+    name: Cleanup
+    needs: [check-version, build-flatpak, create-release]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Cleanup artifacts
+      run: |
+        echo "Build and release process completed"
+        echo "Version: ${{ needs.check-version.outputs.version }}"
+        echo "Should build: ${{ needs.check-version.outputs.should_build }}"
